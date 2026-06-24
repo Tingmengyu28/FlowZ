@@ -1,0 +1,108 @@
+model:
+  swinir:
+    target: utils.model.swinir.SwinIR
+    params:
+      img_size: 256
+      patch_size: 1
+      in_chans: 2
+      embed_dim: 180
+      drop_rate: 0.1
+      attn_drop_rate: 0.1
+      depths: [6, 6, 6, 6, 6, 6, 6, 6]
+      num_heads: [6, 6, 6, 6, 6, 6, 6, 6]
+      window_size: 8
+      mlp_ratio: 2
+      sf: 8
+      img_range: 1.0
+      upsampler: "nearest+conv"
+      resi_connection: "1conv"
+      unshuffle: True
+      unshuffle_scale: 8
+  palette:
+    target: utils.model.palette.UNet
+    params:
+      image_size: 256
+      in_channel: 3
+      out_channel: 1
+      inner_channel: 32
+      attn_n_head: 8
+      channel_mults: [1, 2, 4, 8, 8]
+      attn_res: [8]
+      dropout: 0.1
+  unet:
+    target: utils.model.unet.UNetModel
+    params:
+      image_size: 256
+      in_channel: 1
+      out_channel: 1
+  jit:
+    target: utils.model.jit_v2.JiT
+    params:
+      input_size: 256
+      in_channels: 1
+      depth: 12
+      hidden_size: 768
+      num_heads: 12
+      bottleneck_dim: 128
+      in_context_len: 32
+      in_context_start: 4
+      patch_size: 16
+      attn_drop: 0.05
+      proj_drop: 0.1
+      
+  gan:
+    generator:
+      target: utils.model.gan.Generator
+      params:
+        in_channel: 2
+    discriminator:
+      target: utils.model.gan.Discriminator
+      params:
+        in_channel: 1
+
+dataset:
+  name: live_cell
+  ch: 2
+
+batch_transform:
+  target: utils.dataset.batch_transform.IdentityBatchTransform
+
+train:
+  batch_size: 32
+  num_workers: 16
+  train_steps: 240000
+  log_every: 20
+  gradient_accumulation_steps: 4
+  val_every: 1000
+  ema_decay: 0.999
+  resume: ~
+  gan:
+    exp_dir: /data1/azt/cv/recoverZ/outputs/${dataset.name}/gan_beyond/ch${dataset.ch}
+    g_step: 2
+    d_step: 1
+    warm_up_steps_d: 20
+    learning_rate_g: 1e-4
+    learning_rate_d: 3e-4
+    adv_weight: 1.0
+    content_alpha: 10
+    gp_lambda: 10
+  fm:
+    exp_dir: /data1/azt/cv/recoverZ/outputs/${dataset.name}/fm_palette
+    learning_rate: 1e-4
+    label_drop_prob: 0.1
+    cfg_scale_interval: 2
+    Beta_alpha: 2.0
+    Beta_beta: 2.0
+  jit:
+    exp_dir: /data1/azt/cv/recoverZ/outputs/${dataset.name}/jit
+    learning_rate: 1e-4
+    label_drop_prob: 0.1
+    cfg_scale_interval: 2
+    
+inference:
+  batch_size: 256
+  fm:
+    num_ode_steps: 100
+    top_n: 640
+  jit:
+    num_ode_steps: 50
