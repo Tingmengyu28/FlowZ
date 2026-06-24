@@ -182,6 +182,5 @@ data_{name}/
 ```bash
 conda create -n recoverz python=3.10 -y
 conda activate recoverz
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-pip install accelerate omegaconf tifffile opencv-python scikit-image lpips tensorboard pillow tqdm
+pip install -r requirements.txt
 ```
