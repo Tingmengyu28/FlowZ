@@ -9,4 +9,4 @@ accelerate launch \
     --num_processes=4 \
     --mixed_precision=fp16 \
     run/train_gan.py \
-    --config configs/train.yaml
+    --config configs/params.yaml

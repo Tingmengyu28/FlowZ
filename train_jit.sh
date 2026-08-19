@@ -10,4 +10,4 @@ accelerate launch \
     --num_processes=2 \
     --mixed_precision=fp16 \
     run/train_jit.py \
-    --config configs/train.yaml
+    --config configs/params.yaml
