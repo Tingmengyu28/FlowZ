@@ -98,9 +98,9 @@ def process_tiff_to_png(tiff_path, output_root, start_folder_idx, filter_type="g
         
         total_output_slices = 0
         
-        # 保留原始TIFF的奇数层（1, 3, 5, ..., 81），但输出文件名是连续的 z1, z2, z3, ...
+        # 每层都保存，输出文件名连续（z1, z2, z3, ...）
         output_idx = 1
-        for slice_idx in range(0, num_slices, 2):
+        for slice_idx in range(0, num_slices):
             slice_data = normalized_data[slice_idx]
             denoised_slice = denoise_slice(slice_data, filter_type, kernel_size, sigmaX)
             
@@ -128,8 +128,8 @@ def process_tiff_to_png(tiff_path, output_root, start_folder_idx, filter_type="g
         return False, 0
 
 def main():
-    DATA_ROOT = "data_brain"
-    INPUT_ROOT = f"{DATA_ROOT}/tif/0505"
+    DATA_ROOT = "data_large_slope"
+    INPUT_ROOT = f"{DATA_ROOT}/tif"
     OUTPUT_ROOT = f"{DATA_ROOT}/images"
     FILTER_TYPE = "gaussian"
     KERNEL_SIZE = 1
@@ -147,7 +147,7 @@ def main():
         item_path = os.path.join(INPUT_ROOT, item)
         if os.path.isdir(item_path):
             # 提取数字
-            for prefix in ['insituVc', 'InsituVc', 'insituvc']:
+            for prefix in ['insituVc', 'InsituVc', 'insituvc', 'Marco-raft']:
                 if item.startswith(prefix):
                     number_str = item[len(prefix):]
                     try:

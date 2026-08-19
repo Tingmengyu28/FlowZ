@@ -1,4 +1,5 @@
 import os
+import random
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -311,15 +312,35 @@ def generate_gt_image(ch, image_idx, z, L_min, L_max, output_dir):
     cv2.imwrite(gt_path, max_pooled)
     print(f"最大池化结果已保存到: {gt_path}")
 
+def stitch_patches(patches, n_rows, n_cols):
+    """
+    将 n_rows x n_cols 个 patch 按行优先顺序拼回大图。
+    patches: 按行优先排列的 (H_patch, W_patch) numpy 数组列表
+    返回: (n_rows*H_patch, n_cols*W_patch) 大图
+    """
+    patch_h, patch_w = patches[0].shape
+    large_h = patch_h * n_rows
+    large_w = patch_w * n_cols
+    large = np.zeros((large_h, large_w), dtype=patches[0].dtype)
+    for idx, patch in enumerate(patches):
+        row = idx // n_cols
+        col = idx % n_cols
+        large[row * patch_h:(row + 1) * patch_h,
+              col * patch_w:(col + 1) * patch_w] = patch
+    return large
+
+
 def process_group_inference(data_root, output_root, layer_input, layer_min, layer_max,
                              checkpoint_path, model_type='fm', cfg_scale_interval=2,
-                             batch_size=8, target_size=256, K=1):
+                             batch_size=8, target_size=256, K=4, n_rows=2, n_cols=2):
     """
     批量处理 data_root 下的所有数字子文件夹，每K个为一组。
-    对于每个子文件夹：
-      - 读取 z{layer_input}.png 作为输入
-      - 推理预测 z{layer_min} 到 z{layer_max} 的所有层
-      - 保存每张预测图像、max_pooling结果、输入图像到 output_root/{子文件夹id}/
+    对于每一组，推理全部子文件夹后按行优先顺序拼接成大图，输出 5 个文件：
+      - input.png: 拼接后的输入图像
+      - input.tif: 拼接后的 GT z-stack TIF
+      - pred.tif: 拼接后的预测 z-stack TIF
+      - input_z{z}.png: 随机抽取某一层的拼接 GT
+      - pred_z{z}.png: 对应层的拼接预测
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -343,109 +364,168 @@ def process_group_inference(data_root, output_root, layer_input, layer_min, laye
     target_layers = list(range(layer_min, layer_max + 1))
     dpm_raw = [layer_input - t for t in target_layers]
     dpm_max = max(abs(d) for d in dpm_raw)
+    num_layers = len(target_layers)
 
-    # 每隔K个取一个子文件夹（1, 1+K, 1+2K, ...）
-    selected_folders = subfolders[::K]
+    # 按 K 个一组分组
+    groups = [subfolders[i:i + K] for i in range(0, len(subfolders), K)]
 
-    print(f"共 {len(subfolders)} 个子文件夹，间隔 K={K}，选中 {len(selected_folders)} 个")
+    print(f"共 {len(subfolders)} 个子文件夹，每 {K} 个为一组（{n_rows}x{n_cols}），共 {len(groups)} 组")
     print(f"输入层：z{layer_input}，目标层：z{layer_min}~z{layer_max}，DPM范围：{min(dpm_raw)}~{max(dpm_raw)}")
 
-    pbar = tqdm(selected_folders, desc="推理子文件夹", unit="folder")
-    for folder_id, folder_name in pbar:
-        subfolder_output = os.path.join(output_root, str(folder_id))
-        os.makedirs(subfolder_output, exist_ok=True)
+    pbar = tqdm(groups, desc="推理组", unit="group")
+    for group_idx, group_folders in enumerate(pbar):
+        # 组名：如 "1-4", "5-8"
+        start_id = group_folders[0][0]
+        end_id = group_folders[-1][0]
+        group_name = f"{start_id}-{end_id}"
+        group_output = os.path.join(output_root, group_name)
+        os.makedirs(group_output, exist_ok=True)
 
-        input_image_path = os.path.join(data_root, folder_name, f"z{layer_input}.png")
-        if not os.path.exists(input_image_path):
-            print(f"\n  跳过 {folder_name}：z{layer_input}.png 不存在")
-            continue
+        # 收集该组所有 patch 的推理结果
+        # all_group_preds[patch_idx][layer_idx] = (H, W) numpy
+        all_group_preds = []       # 每个patch的pred: list of (num_layers, H, W)
+        all_group_inputs = []      # 每个patch的input: (H, W) numpy
+        all_group_gts = []         # 每个patch的gt z-stack: (num_layers, H, W) numpy
 
-        lq = load_image(input_image_path, device, target_size)
+        for folder_id, folder_name in group_folders:
+            input_image_path = os.path.join(data_root, folder_name, f"z{layer_input}.png")
+            if not os.path.exists(input_image_path):
+                print(f"\n  跳过 {folder_name}：z{layer_input}.png 不存在，用零填充")
+                all_group_preds.append(np.zeros((num_layers, target_size, target_size), dtype=np.uint8))
+                all_group_inputs.append(np.zeros((target_size, target_size), dtype=np.uint8))
+                all_group_gts.append(np.zeros((num_layers, target_size, target_size), dtype=np.uint8))
+                continue
 
-        dpm_batches = split_into_batches(dpm_raw, batch_size=batch_size)
-        all_predictions = []
+            lq = load_image(input_image_path, device, target_size)
 
-        for dpm_vals in dpm_batches:
-            dpm_normalized = [v / dpm_max for v in dpm_vals]
-            lq_batch, dpm_batch = prepare_batch_input(lq, dpm_normalized, 1.0, device=device)
-            if model_type == 'fm':
-                output = run_fm_inference_batch(model, lq_batch, dpm_batch, cfg_scale_interval)
-            elif model_type == 'gan':
-                with torch.no_grad():
-                    output = model(lq_batch, dpm_batch)
-            elif model_type == 'jit':
-                output = run_jit_inference_batch(model, lq_batch, dpm_batch, cfg_scale_interval)
-            all_predictions.append(output)
+            # 推理所有目标层
+            dpm_batches = split_into_batches(dpm_raw, batch_size=batch_size)
+            all_predictions = []
 
-        all_predictions = torch.cat(all_predictions, dim=0)
+            for dpm_vals in dpm_batches:
+                dpm_normalized = [v / dpm_max for v in dpm_vals]
+                lq_batch, dpm_batch = prepare_batch_input(lq, dpm_normalized, 1.0, device=device)
+                if model_type == 'fm':
+                    output = run_fm_inference_batch(model, lq_batch, dpm_batch, cfg_scale_interval)
+                elif model_type == 'gan':
+                    with torch.no_grad():
+                        output = model(lq_batch, dpm_batch)
+                elif model_type == 'jit':
+                    output = run_jit_inference_batch(model, lq_batch, dpm_batch, cfg_scale_interval)
+                all_predictions.append(output)
 
-        ssim_values = {}
+            all_predictions = torch.cat(all_predictions, dim=0)  # (num_layers, 1, H, W)
+            pred_np = all_predictions.squeeze(1).cpu().numpy() * 255.0
+            pred_np = np.clip(pred_np, 0, 255).astype(np.uint8)  # (num_layers, H, W)
+            all_group_preds.append(pred_np)
 
-        for i, z_target in enumerate(target_layers):
-            pred = all_predictions[i].squeeze().cpu().numpy()
-            pred = np.clip(pred * 255.0, 0, 255).astype(np.uint8)
+            # input
+            input_save = lq.squeeze().cpu().numpy()
+            input_save = np.clip(input_save * 255.0, 0, 255).astype(np.uint8)
+            all_group_inputs.append(input_save)
 
-            # 加载GT图像并计算SSIM
-            gt_path = os.path.join(data_root, folder_name, f"z{z_target}.png")
-            if os.path.exists(gt_path):
-                gt = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
-                if gt is not None:
-                    gt = cv2.resize(gt, (target_size, target_size))
-                    val = ssim(pred, gt, data_range=255)
-                    ssim_values[z_target] = val
-                    # 在图像左上方绘制SSIM值
-                    cv2.putText(pred, f"SSIM:{val:.4f}", (5, 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1, cv2.LINE_AA)
+            # GT z-stack
+            gt_stack = []
+            for z_target in target_layers:
+                gt_path = os.path.join(data_root, folder_name, f"z{z_target}.png")
+                if os.path.exists(gt_path):
+                    frame = Image.open(gt_path).convert('L')
+                    if frame.size != (target_size, target_size):
+                        frame = frame.resize((target_size, target_size), Image.BILINEAR)
+                    gt_stack.append(np.array(frame))
+                else:
+                    gt_stack.append(np.zeros((target_size, target_size), dtype=np.uint8))
+            all_group_gts.append(np.stack(gt_stack, axis=0))  # (num_layers, H, W)
 
-            Image.fromarray(pred).save(os.path.join(subfolder_output, f"z{z_target}.png"))
+        # 不足 K 个的用零填充补齐
+        while len(all_group_preds) < K:
+            all_group_preds.append(np.zeros((num_layers, target_size, target_size), dtype=np.uint8))
+            all_group_inputs.append(np.zeros((target_size, target_size), dtype=np.uint8))
+            all_group_gts.append(np.zeros((num_layers, target_size, target_size), dtype=np.uint8))
 
-        # 保存SSIM结果
-        if ssim_values:
-            avg_ssim = np.mean(list(ssim_values.values()))
-            with open(os.path.join(subfolder_output, "ssim.txt"), 'w') as f:
-                for zt, val in sorted(ssim_values.items()):
-                    f.write(f"z{zt}: {val:.6f}\n")
-                f.write(f"average: {avg_ssim:.6f}\n")
+        # === 拼接并保存 5 个文件 ===
 
-        all_for_pooling = all_predictions.squeeze(1).unsqueeze(0)
-        max_pooled, _ = torch.max(all_for_pooling, dim=1, keepdim=True)
-        max_pooled = max_pooled.squeeze().cpu().numpy()
-        max_pooled = np.clip(max_pooled * 255.0, 0, 255).astype(np.uint8)
-        Image.fromarray(max_pooled).save(os.path.join(subfolder_output, "pred.png"))
+        # 1. input.png（拼接输入层）
+        stitched_input = stitch_patches(all_group_inputs, n_rows, n_cols)
+        Image.fromarray(stitched_input).save(os.path.join(group_output, "input.png"))
 
-        input_save = lq.squeeze().cpu().numpy()
-        input_save = np.clip(input_save * 255.0, 0, 255).astype(np.uint8)
-        Image.fromarray(input_save).save(os.path.join(subfolder_output, "input.png"))
+        # 2. pred.tif（拼接预测 z-stack）
+        pred_tif_frames = []
+        for layer_idx in range(num_layers):
+            patches = [all_group_preds[p][layer_idx] for p in range(K)]
+            stitched = stitch_patches(patches, n_rows, n_cols)
+            pred_tif_frames.append(Image.fromarray(stitched))
+        pred_tif_path = os.path.join(group_output, "pred.tif")
+        pred_tif_frames[0].save(pred_tif_path, save_all=True,
+                                append_images=pred_tif_frames[1:], compression="tiff_adobe_deflate")
+
+        # 3. input.tif（拼接 GT z-stack）
+        input_tif_frames = []
+        for layer_idx in range(num_layers):
+            patches = [all_group_gts[p][layer_idx] for p in range(K)]
+            stitched = stitch_patches(patches, n_rows, n_cols)
+            input_tif_frames.append(Image.fromarray(stitched))
+        input_tif_path = os.path.join(group_output, "input.tif")
+        input_tif_frames[0].save(input_tif_path, save_all=True,
+                                 append_images=input_tif_frames[1:], compression="tiff_adobe_deflate")
+
+        # 4 & 5. 随机抽取某一层，保存 input_z{z}.png 和 pred_z{z}.png
+        random_z = random.choice(target_layers)
+        random_idx = target_layers.index(random_z)
+
+        # GT 的该层（拼接）
+        gt_patches = [all_group_gts[p][random_idx] for p in range(K)]
+        stitched_gt = stitch_patches(gt_patches, n_rows, n_cols)
+        Image.fromarray(stitched_gt).save(os.path.join(group_output, f"input_z{random_z}.png"))
+
+        # pred 的该层（拼接）
+        pred_patches = [all_group_preds[p][random_idx] for p in range(K)]
+        stitched_pred = stitch_patches(pred_patches, n_rows, n_cols)
+        Image.fromarray(stitched_pred).save(os.path.join(group_output, f"pred_z{random_z}.png"))
+
+        print(f"  组 {group_name} 完成：input.png, input.tif, pred.tif, input_z{random_z}.png, pred_z{random_z}.png")
 
     pbar.close()
     print(f"\n处理完成！结果保存在：{output_root}")
 
 
 if __name__ == "__main__":
-    group_id = '3'
-    data_root = f"/data1/azt/cv/recoverZ/data_test/group{group_id}"
-    output_root = f"outputs/test/group{group_id}"
+    group_id =  ['1', '2', '3']  # 可以是 str（如 '1'）或 list[str]（如 ['1', '2', '3']）
     model_type = "real_plain"
     layer_input = 10
     layer_min, layer_max = 1, 21
-    K = 4
+    K = 4                # 每 K 个子文件夹为一组
+    n_rows = 2           # 拼接行数（K = n_rows * n_cols）
+    n_cols = 2           # 拼接列数
     cfg_scale_interval = 2
     batch_size = 8
 
     network_path = f'/data1/azt/cv/recoverZ/outputs/{model_type}/fm_palette'
     checkpoint_path = os.path.join(network_path, 'checkpoints/best_val_loss_ema.pt')
-    os.makedirs(output_root, exist_ok=True)
 
-    process_group_inference(
-        data_root=data_root,
-        output_root=output_root,
-        layer_input=layer_input,
-        layer_min=layer_min,
-        layer_max=layer_max,
-        checkpoint_path=checkpoint_path,
-        model_type='fm',
-        cfg_scale_interval=cfg_scale_interval,
-        batch_size=batch_size,
-        target_size=256,
-        K=K
-    )
+    # 支持 group_id 为 str 或 list[str]
+    group_ids = [group_id] if isinstance(group_id, str) else list(group_id)
+
+    for gid in group_ids:
+        print(f"\n{'='*60}")
+        print(f"开始处理 group{gid}")
+        print(f"{'='*60}")
+        data_root = f"/data1/azt/cv/recoverZ/data_test/group{gid}"
+        output_root = f"outputs/test/group{gid}"
+        os.makedirs(output_root, exist_ok=True)
+
+        process_group_inference(
+            data_root=data_root,
+            output_root=output_root,
+            layer_input=layer_input,
+            layer_min=layer_min,
+            layer_max=layer_max,
+            checkpoint_path=checkpoint_path,
+            model_type='fm',
+            cfg_scale_interval=cfg_scale_interval,
+            batch_size=batch_size,
+            target_size=256,
+            K=K,
+            n_rows=n_rows,
+            n_cols=n_cols
+        )

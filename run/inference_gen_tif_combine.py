@@ -111,16 +111,18 @@ def brain_inference_combine(group_path, output_root, z, z_range, checkpoint_path
     """
     对 group 下所有 patch_X 进行推理，按 n_rows x n_cols 空间布局拼接结果。
 
+    z 可以是单个 int 或 list[int]，每个 z 会分别推理并保存到 output_root/input_z{z}/ 下。
+
     流程：
       1. 扫描 group_path/patch_X 目录，按 patch 索引排序
-      2. 对每个 patch 读取 z{z}.png 作为输入，推理全部目标层 [tif_z_start, tif_z_end]
+      2. 对每个 z 值：读取每个 patch 的 z{z}.png 作为输入，推理全部目标层 [tif_z_start, tif_z_end]
       3. 按 z 层收集所有 patch 的 pred，拼接成大图
       4. 按 z 层收集所有 patch 的 input 图像，拼接成大图
-      5. 输出 input_*.tif 和 pred_*.tif
+      5. 输出 input_*.tif 和 pred_*.tif 和 input_z{z}.png
 
     :param group_path: 如 data_brain/images/4_488_Em525_Widefield_
     :param output_root: 输出目录
-    :param z: 输入 z 层号（每个 patch 读取 z{z}.png）
+    :param z: 输入 z 层号（int 或 list[int]）
     :param z_range: dpm 归一化除数（控制模型对距离的敏感度）
     :param checkpoint_path: 模型 checkpoint 路径
     :param cfg_scale_interval: CFG scale
@@ -132,6 +134,9 @@ def brain_inference_combine(group_path, output_root, z, z_range, checkpoint_path
     :param n_cols: 原始分块列数
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 统一 z 为 list
+    z_list = [z] if isinstance(z, int) else list(z)
 
     # 1. 收集所有 patch 目录，按索引排序
     patch_dirs = sorted(
@@ -153,17 +158,6 @@ def brain_inference_combine(group_path, output_root, z, z_range, checkpoint_path
     tif_layers = list(range(tif_z_start, tif_z_end + 1))
     num_layers = len(tif_layers)
 
-    # dpm 参数：输入层 z 到目标层 t 的距离
-    dpm_raw = [t - z for t in tif_layers]
-    dpm_max = z_range  # z_range 作为 dpm 归一化除数
-
-    print(f"输入层：z{z}")
-    print(f"推理目标层：z{tif_z_start} ~ z{tif_z_end}（共 {num_layers} 层）")
-    print(f"DPM 范围：{min(dpm_raw)} ~ {max(dpm_raw)}，归一化除数：{dpm_max}")
-    print(f"拼接布局：{n_rows}x{n_cols}")
-
-    os.makedirs(output_root, exist_ok=True)
-
     # 3. 确定 patch 尺寸（读取第一个 patch 的任一 PNG）
     first_patch = os.path.join(group_path, patch_dirs[0])
     first_z = sorted([f for f in os.listdir(first_patch) if f.endswith('.png')])[0]
@@ -171,101 +165,123 @@ def brain_inference_combine(group_path, output_root, z, z_range, checkpoint_path
     patch_h, patch_w = np.array(first_img).shape
     large_h = patch_h * n_rows
     large_w = patch_w * n_cols
-    print(f"Patch 尺寸: {patch_h}x{patch_w}, 大图尺寸: {large_h}x{large_w}")
 
-    # 4. 对每个 patch 进行推理
-    all_patch_preds = []  # [num_patches, num_layers, H_pred, W_pred]
+    print(f"输入层：z{z_list}")
+    print(f"推理目标层：z{tif_z_start} ~ z{tif_z_end}（共 {num_layers} 层）")
+    print(f"拼接布局：{n_rows}x{n_cols}，Patch 尺寸: {patch_h}x{patch_w}, 大图尺寸: {large_h}x{large_w}")
 
-    for pi, patch_dir_name in enumerate(patch_dirs):
-        patch_path = os.path.join(group_path, patch_dir_name)
-        lq_path = os.path.join(patch_path, f"z{z}.png")
-        if not os.path.exists(lq_path):
-            print(f"错误：{lq_path} 不存在，中止")
-            return
+    os.makedirs(output_root, exist_ok=True)
 
-        lq = load_image(lq_path, device, target_size)
+    # 对每个 z 值分别推理
+    for z_val in z_list:
+        print(f"\n{'='*60}")
+        print(f"开始处理 z={z_val}")
+        print(f"{'='*60}")
 
-        # 批处理该 patch 的所有目标层
-        dpm_batches = split_into_batches(dpm_raw, batch_size=batch_size)
-        patch_pred_list = []
-        for dpm_vals in dpm_batches:
-            dpm_normalized = [v / dpm_max for v in dpm_vals]
-            lq_batch, dpm_batch = prepare_batch_input(lq, dpm_normalized, 1.0, device=device)
-            output = run_fm_inference_batch(model, lq_batch, dpm_batch, cfg_scale_interval)
-            patch_pred_list.append(output)
+        z_output = os.path.join(output_root, f"input_z{z_val}")
+        os.makedirs(z_output, exist_ok=True)
 
-        patch_pred = torch.cat(patch_pred_list, dim=0)  # (num_layers, 1, H, W)
-        all_patch_preds.append(patch_pred)
-        print(f"  Patch [{pi + 1}/{num_patches}] {patch_dir_name} 推理完成")
+        # dpm 参数：输入层 z_val 到目标层 t 的距离
+        dpm_raw = [t - z_val for t in tif_layers]
+        dpm_max = z_range  # z_range 作为 dpm 归一化除数
 
-    # 5. 按 z 层拼接 input 和 pred
-    input_frames = []
-    pred_frames = []
+        print(f"DPM 范围：{min(dpm_raw)} ~ {max(dpm_raw)}，归一化除数：{dpm_max}")
 
-    for layer_idx, target_z in enumerate(tif_layers):
-        # --- 拼接 input ---
-        input_patches = []
-        for patch_dir_name in patch_dirs:
+        # 4. 对每个 patch 进行推理
+        all_patch_preds = []  # [num_patches, num_layers, H_pred, W_pred]
+
+        for pi, patch_dir_name in enumerate(patch_dirs):
             patch_path = os.path.join(group_path, patch_dir_name)
-            z_path = os.path.join(patch_path, f"z{target_z}.png")
-            if os.path.exists(z_path):
-                img = Image.open(z_path).convert('L')
-                patch_np = np.array(img)
-                if patch_np.shape != (patch_h, patch_w):
-                    img = img.resize((patch_w, patch_h), Image.BILINEAR)
+            lq_path = os.path.join(patch_path, f"z{z_val}.png")
+            if not os.path.exists(lq_path):
+                print(f"错误：{lq_path} 不存在，跳过 z={z_val}")
+                break
+
+            lq = load_image(lq_path, device, target_size)
+
+            # 批处理该 patch 的所有目标层
+            dpm_batches = split_into_batches(dpm_raw, batch_size=batch_size)
+            patch_pred_list = []
+            for dpm_vals in dpm_batches:
+                dpm_normalized = [v / dpm_max for v in dpm_vals]
+                lq_batch, dpm_batch = prepare_batch_input(lq, dpm_normalized, 1.0, device=device)
+                output = run_fm_inference_batch(model, lq_batch, dpm_batch, cfg_scale_interval)
+                patch_pred_list.append(output)
+
+            patch_pred = torch.cat(patch_pred_list, dim=0)  # (num_layers, 1, H, W)
+            all_patch_preds.append(patch_pred)
+            print(f"  Patch [{pi + 1}/{num_patches}] {patch_dir_name} 推理完成")
+
+        if len(all_patch_preds) < num_patches:
+            print(f"z={z_val} 推理不完整，跳过保存")
+            continue
+
+        # 5. 按 z 层拼接 input 和 pred
+        input_frames = []
+        pred_frames = []
+
+        for layer_idx, target_z in enumerate(tif_layers):
+            # --- 拼接 input ---
+            input_patches = []
+            for patch_dir_name in patch_dirs:
+                patch_path = os.path.join(group_path, patch_dir_name)
+                z_path = os.path.join(patch_path, f"z{target_z}.png")
+                if os.path.exists(z_path):
+                    img = Image.open(z_path).convert('L')
                     patch_np = np.array(img)
-                input_patches.append(patch_np)
-            else:
-                # 某些 z 层可能不存在，用零填充
-                input_patches.append(np.zeros((patch_h, patch_w), dtype=np.uint8))
-        large_input = stitch_patches(input_patches, n_rows, n_cols)
-        input_frames.append(Image.fromarray(large_input))
+                    if patch_np.shape != (patch_h, patch_w):
+                        img = img.resize((patch_w, patch_h), Image.BILINEAR)
+                        patch_np = np.array(img)
+                    input_patches.append(patch_np)
+                else:
+                    input_patches.append(np.zeros((patch_h, patch_w), dtype=np.uint8))
+            large_input = stitch_patches(input_patches, n_rows, n_cols)
+            input_frames.append(Image.fromarray(large_input))
 
-        # --- 拼接 pred ---
-        pred_patches = []
-        for pi in range(num_patches):
-            pred_tensor = all_patch_preds[pi][layer_idx]  # (1, 1, H, W)
-            pred_np = pred_tensor.squeeze().cpu().numpy() * 255.0
-            pred_np = np.clip(pred_np, 0, 255).astype(np.uint8)
-            # resize 回 patch 尺寸（模型输出 target_size x target_size）
-            pred_img = Image.fromarray(pred_np).resize((patch_w, patch_h), Image.BILINEAR)
-            pred_patches.append(np.array(pred_img))
-        large_pred = stitch_patches(pred_patches, n_rows, n_cols)
-        pred_frames.append(Image.fromarray(large_pred))
+            # --- 拼接 pred ---
+            pred_patches = []
+            for pi in range(num_patches):
+                pred_tensor = all_patch_preds[pi][layer_idx]  # (1, 1, H, W)
+                pred_np = pred_tensor.squeeze().cpu().numpy() * 255.0
+                pred_np = np.clip(pred_np, 0, 255).astype(np.uint8)
+                pred_img = Image.fromarray(pred_np).resize((patch_w, patch_h), Image.BILINEAR)
+                pred_patches.append(np.array(pred_img))
+            large_pred = stitch_patches(pred_patches, n_rows, n_cols)
+            pred_frames.append(Image.fromarray(large_pred))
 
-        if (layer_idx + 1) % 10 == 0 or layer_idx == 0:
-            print(f"  拼接进度: {layer_idx + 1}/{num_layers}")
+            if (layer_idx + 1) % 10 == 0 or layer_idx == 0:
+                print(f"  拼接进度: {layer_idx + 1}/{num_layers}")
 
-    # 6. 保存 input TIF
-    input_tif_path = os.path.join(output_root, f"input_z{tif_z_start}_z{tif_z_end}.tif")
-    input_frames[0].save(input_tif_path, save_all=True,
-                         append_images=input_frames[1:], compression="tiff_adobe_deflate")
-    print(f"\nInput TIF 已保存：{input_tif_path}  ({len(input_frames)} 帧, {large_w}x{large_h})")
+        # 6. 保存 input TIF
+        input_tif_path = os.path.join(z_output, f"input_z{tif_z_start}_z{tif_z_end}.tif")
+        input_frames[0].save(input_tif_path, save_all=True,
+                             append_images=input_frames[1:], compression="tiff_adobe_deflate")
+        print(f"Input TIF 已保存：{input_tif_path}  ({len(input_frames)} 帧, {large_w}x{large_h})")
 
-    # 7. 保存 pred TIF
-    pred_tif_path = os.path.join(output_root, f"pred_z{tif_z_start}_z{tif_z_end}.tif")
-    pred_frames[0].save(pred_tif_path, save_all=True,
-                        append_images=pred_frames[1:], compression="tiff_adobe_deflate")
-    print(f"Pred TIF 已保存：{pred_tif_path}  ({len(pred_frames)} 帧, {large_w}x{large_h})")
+        # 7. 保存 pred TIF
+        pred_tif_path = os.path.join(z_output, f"pred_z{tif_z_start}_z{tif_z_end}.tif")
+        pred_frames[0].save(pred_tif_path, save_all=True,
+                            append_images=pred_frames[1:], compression="tiff_adobe_deflate")
+        print(f"Pred TIF 已保存：{pred_tif_path}  ({len(pred_frames)} 帧, {large_w}x{large_h})")
 
-    # 8. 从 input TIF 中提取第 z 层保存为 PNG
-    z_layer_idx = z - tif_z_start
-    if 0 <= z_layer_idx < len(input_frames):
-        z_png_path = os.path.join(output_root, f"input_z{z}.png")
-        input_frames[z_layer_idx].save(z_png_path)
-        print(f"Input z{z} 层已保存：{z_png_path}")
-    else:
-        print(f"警告：z{z} 不在 TIF 范围 [{tif_z_start}, {tif_z_end}] 内，无法提取")
+        # 8. 从 input TIF 中提取第 z_val 层保存为 PNG
+        z_layer_idx = z_val - tif_z_start
+        if 0 <= z_layer_idx < len(input_frames):
+            z_png_path = os.path.join(z_output, f"input_z{z_val}.png")
+            input_frames[z_layer_idx].save(z_png_path)
+            print(f"Input z{z_val} 层已保存：{z_png_path}")
+        else:
+            print(f"警告：z{z_val} 不在 TIF 范围 [{tif_z_start}, {tif_z_end}] 内，无法提取")
 
     print(f"\n全部完成，结果保存在：{output_root}")
 
 
 if __name__ == "__main__":
-    DATA_ROOT = "live_cell"
-    image_id = "plane 6 z-stack"
+    DATA_ROOT = "live_cell_0625"
+    image_id = "7-Z_stack-channel_1"
     group_path = f"data_{DATA_ROOT}/images/{image_id}"
     output_root = f"outputs/{DATA_ROOT}/combined/{image_id}"
-    z = 15
+    z = [16, 19, 22]   # 支持 int 或 list[int]，每个 z 会单独推理并保存到 output_root/input_z{z}/ 下
     z_range = 20
     cfg_scale_interval = 2
     batch_size = 8
@@ -274,7 +290,8 @@ if __name__ == "__main__":
     n_rows = 4
     n_cols = 4
 
-    network_path = f'/data1/azt/cv/recoverZ/outputs/{DATA_ROOT}/fm_palette'
+    # network_path = f'/data1/azt/cv/recoverZ/outputs/{DATA_ROOT}/fm_palette'
+    network_path = '/data1/azt/cv/recoverZ/outputs/live_cell/fm_palette'
     checkpoint_path = os.path.join(network_path, 'checkpoints/best_val_loss_ema.pt')
 
     os.makedirs(output_root, exist_ok=True)
